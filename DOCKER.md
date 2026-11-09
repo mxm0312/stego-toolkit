@@ -42,16 +42,19 @@ stego/engines/steganogan/weights/basic.steg
 docker run --rm -p 127.0.0.1:8501:8501 stego:light
 ```
 
-Тяжёлый образ с весами — открыть <http://localhost:8502>:
+Тяжёлый образ с NVIDIA GPU и весами — открыть <http://localhost:8502>:
 
 ```bash
-docker run --rm -p 127.0.0.1:8502:8501 \
+docker run --rm --gpus all -p 127.0.0.1:8502:8501 \
   -e LFVSN_WEIGHTS=/weights/lfvsn \
   -e STEGANOGAN_WEIGHTS=/weights/steganogan \
   -v "$PWD/stego/engines/lfvsn/weights:/weights/lfvsn:ro" \
   -v "$PWD/stego/engines/steganogan/weights:/weights/steganogan:ro" \
   stego:heavy
 ```
+
+`--gpus all` передаёт видеокарту контейнеру. Для запуска UI на CPU уберите этот флаг.
+После изменения флага запустите новый контейнер; пересобирать образ не нужно.
 
 Выберите метод и режим, загрузите контейнер и секрет, нажмите «Упаковать» и скачайте результат.
 Для извлечения выберите тот же метод и загрузите полученный файл.
@@ -126,7 +129,8 @@ docker run --rm -v "$PWD:/data" \
 Для начала используйте изображение от 512×512 и короткий текст. Для базовой архитектуры
 замените `dense` на `basic` в обеих командах и подключите `basic.steg`.
 
-Для настроенного NVIDIA GPU добавьте `--gpus all` в параметры `docker run` перед именем
-тяжёлого образа. В CLI замените `--device cpu` на `--device cuda`; UI выберет устройство автоматически.
+Примеры CLI выше используют CPU. Для NVIDIA GPU добавьте `--gpus all` в параметры
+`docker run` перед именем тяжёлого образа и замените `--device cpu` на `--device cuda`.
+В UI устройство выбирается автоматически.
 
 Сохраняйте файлы с секретом без перекодирования: оно может повредить или удалить скрытые данные.
