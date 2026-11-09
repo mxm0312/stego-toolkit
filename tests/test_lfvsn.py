@@ -1,3 +1,7 @@
+import io
+import shutil
+from contextlib import closing
+
 import pytest
 
 from stego import Steganographer, available
@@ -138,3 +142,73 @@ def test_engine_pipeline_end_to_end(tmp_path, monkeypatch, secret_length):
     recovered = tmp_path / "recovered.mp4"
     recovered.write_bytes(result.secret.data)
     assert video.probe(recovered).frames == 6
+
+
+@pytest.fixture(scope="module")
+def image_test_weights(tmp_path_factory):
+    from stego.engines.lfvsn.model import build_vsn
+
+    path = tmp_path_factory.mktemp("lfvsn_image_weights") / "1video.pth"
+    torch.save(build_vsn(num_video=1).state_dict(), path)
+    return path
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="нужен ffmpeg")
+@pytest.mark.parametrize("suffix", [".mp4", ".mkv"])
+@pytest.mark.parametrize("cover_length", [2, 20])
+def test_photo_embedded_once_preserves_full_video(
+    tmp_path, monkeypatch, image_test_weights, suffix, cover_length
+):
+    """Длина видео не должна превращать одну фотографию в сотни скрытых кадров."""
+    import av
+    import numpy as np
+    from PIL import Image
+
+    from stego import extract, pack
+    from stego.engines.lfvsn import runner
+    from stego.media import video
+
+    cover = tmp_path / "cover.mkv"
+    frames = np.random.default_rng(123).integers(0, 256, (cover_length, 16, 16, 3), np.uint8)
+    _write_video(cover, frames)
+    photo = tmp_path / "photo.jpg"
+    Image.fromarray(frames[0]).save(photo)
+    output = tmp_path / f"stego{suffix}"
+
+    processed = []
+    original_hide = runner.iter_hide
+
+    def counted_hide(*args, **kwargs):
+        with closing(original_hide(*args, **kwargs)) as generated:
+            for frame in generated:
+                processed.append(1)
+                yield frame
+
+    monkeypatch.setattr(runner, "iter_hide", counted_hide)
+    monkeypatch.setattr(video, "read_frames", lambda *a: pytest.fail("video loaded into memory"))
+    progress = []
+    pack(
+        cover,
+        photo,
+        output,
+        method="lfvsn",
+        device="cpu",
+        weights_path=image_test_weights,
+        progress=lambda done, total: progress.append((done, total)),
+    )
+    assert len(processed) == 1
+    assert progress == [(0, 1), (1, 1)]
+    index = video.stego_stream_index(output, "lfvsn-image")
+    assert index == 1
+    assert video.probe(output).frames == cover_length
+    assert video.probe(output, video_index=index).frames == 1
+    with av.open(str(output)) as c:
+        assert not int(c.streams.video[index].disposition) & 1
+        if suffix == ".mp4":
+            assert c.streams.video[0].codec_context.format.name == "yuv420p"
+
+    result = extract(output, method="lfvsn", device="cpu", weights_path=image_test_weights)
+    assert result.secret.filename == "recovered_secret.png"
+    assert result.secret.media_type == "image/png"
+    with Image.open(io.BytesIO(result.secret.data)) as recovered:
+        assert recovered.size == (16, 16)

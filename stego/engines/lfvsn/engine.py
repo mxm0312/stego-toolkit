@@ -71,6 +71,29 @@ class LFVSNVideoEngine(StegoEngine):
 
         info = video.probe(container)
         fps = Fraction(info.fps).limit_denominator(1_000_000)
+        if not self._is_video(secret):
+            # Одно изображение достаточно встроить в один кадр. Остальной ролик
+            # остаётся сжатым, а RGB-кадр с секретом хранится отдельной дорожкой.
+            if progress:
+                progress(0, 1)
+            with (
+                closing(video.iter_frames(container)) as cover,
+                closing(self._iter_secret_frames(secret, (info.width, info.height))) as source,
+                closing(
+                    runner.iter_hide(
+                        islice(cover, 2),
+                        islice(source, 2),
+                        device=dev,
+                        num_video=num_video,
+                        weights_path=weights_path,
+                    )
+                ) as stego,
+            ):
+                frame = next(stego)
+            video.write_stego_container(container, output, (frame,), fps, method="lfvsn-image")
+            if progress:
+                progress(1, 1)
+            return
         with (
             closing(video.iter_frames(container)) as cover,
             closing(self._iter_secret_frames(secret, (info.width, info.height))) as source,
@@ -101,10 +124,11 @@ class LFVSNVideoEngine(StegoEngine):
         dev = resolve_device(device)  # проверит torch/устройство до тяжёлого импорта runner
         from stego.engines.lfvsn import runner
 
-        info = video.probe(container)
+        image_index = video.stego_stream_index(container, "lfvsn-image")
+        info = video.probe(container, video_index=image_index)
         fps = Fraction(info.fps).limit_denominator(1_000_000)
         with (
-            closing(video.iter_frames(container)) as stego,
+            closing(video.iter_frames(container, video_index=image_index)) as stego,
             tempfile.TemporaryDirectory(prefix="lfvsn_") as tmp,
         ):
             frames = runner.iter_reveal(
@@ -115,10 +139,27 @@ class LFVSNVideoEngine(StegoEngine):
                 progress=progress,
                 total=info.frames,
             )
+            if image_index:
+                from PIL import Image
+
+                with closing(frames) as images:
+                    frame = next(images)
+                buffer = io.BytesIO()
+                Image.fromarray(frame).save(buffer, format="PNG")
+                return Secret(
+                    buffer.getvalue(), filename="recovered_secret.png", media_type="image/png"
+                )
             out = Path(tmp) / "recovered_secret.mp4"
             video.write_viewable(out, frames, fps)
             data = out.read_bytes()
         return Secret(data, filename="recovered_secret.mp4", media_type="video/mp4")
+
+    @staticmethod
+    def _is_video(secret: Secret) -> bool:
+        return (
+            secret.media_type.startswith("video/")
+            or Path(secret.filename).suffix.lower() in _VIDEO_SUFFIXES
+        )
 
     @staticmethod
     def _iter_secret_frames(secret: Secret, size_wh):
@@ -130,8 +171,7 @@ class LFVSNVideoEngine(StegoEngine):
                 return frame
             return np.array(Image.fromarray(frame).resize(size_wh, Image.Resampling.BILINEAR))
 
-        suffix = Path(secret.filename).suffix.lower()
-        if secret.media_type.startswith("video/") or suffix in _VIDEO_SUFFIXES:
+        if LFVSNVideoEngine._is_video(secret):
             with tempfile.TemporaryDirectory(prefix="lfvsn_sec_") as tmp:
                 path = Path(tmp) / (Path(secret.filename).name or "secret.mkv")
                 path.write_bytes(secret.data)

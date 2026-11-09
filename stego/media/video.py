@@ -96,31 +96,44 @@ def stego_stream_index(container: str | Path, method: str) -> int:
 
     with av.open(str(container)) as c:
         for i, stream in enumerate(c.streams.video):
-            if stream.metadata.get("handler_name") == f"stego-{method}-v1":
+            metadata = {key.lower(): value for key, value in stream.metadata.items()}
+            if metadata.get("handler_name") == f"stego-{method}-v1":
                 return i
     return 0
 
 
 def write_browser_mp4(container: str | Path, output: str | Path, frames, fps: Fraction) -> None:
-    """Обычный H.264 для просмотра + точные RGB-кадры LSB в отдельной дорожке.
+    """Браузерный MP4 для LSB с точными RGB-кадрами в дополнительной дорожке."""
+    if Path(output).suffix.lower() != ".mp4":
+        raise ContainerError("браузерный режим LSB требует выходной файл .mp4")
+    write_stego_container(container, output, frames, fps, method="lsb")
 
-    Основная совместимая H.264-дорожка копируется без перекодирования. Остальные кодеки
-    преобразуются в H.264/yuv420p; звук сохраняется в AAC. Скрытая дорожка не выбрана по умолчанию.
+
+def write_stego_container(
+    container: str | Path, output: str | Path, frames, fps: Fraction, *, method: str
+) -> None:
+    """Сжатое основное видео и отдельная дорожка с точными кадрами движка.
+
+    MP4/MOV получают обычную H.264/yuv420p-дорожку для просмотра. Для MKV исходная
+    видеодорожка копируется. Скрытые RGB-кадры сохраняются без потерь.
     """
     import av
 
     output = Path(output)
-    if output.suffix.lower() != ".mp4":
-        raise ContainerError("браузерный режим LSB требует выходной файл .mp4")
+    suffix = output.suffix.lower()
+    if suffix not in _ENCODERS:
+        raise ContainerError(f"неподдерживаемый выходной формат: {suffix}")
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
-        raise ContainerError("для браузерного MP4 требуется установленный ffmpeg")
+        raise ContainerError("для записи контейнера со скрытой дорожкой требуется ffmpeg")
     with av.open(str(container)) as c:
         codec = c.streams.video[0].codec_context
-        compatible = codec.name == "h264" and codec.format.name in ("yuv420p", "yuvj420p")
+        compatible = suffix == ".mkv" or (
+            codec.name == "h264" and codec.format.name in ("yuv420p", "yuvj420p")
+        )
     with tempfile.TemporaryDirectory(prefix=".stego_", dir=output.parent) as tmp:
         hidden = Path(tmp) / "hidden.mp4"
-        result = Path(tmp) / "result.mp4"
+        result = Path(tmp) / f"result{suffix}"
         write_lossless(hidden, frames, fps)
         cmd = [
             ffmpeg,
@@ -152,10 +165,10 @@ def write_browser_mp4(container: str | Path, output: str | Path, frames, fps: Fr
             "-disposition:v:1",
             "0",
             "-metadata:s:v:1",
-            "handler_name=stego-lsb-v1",
-            "-movflags",
-            "+faststart",
+            f"handler_name=stego-{method}-v1",
         ]
+        if suffix != ".mkv":
+            cmd += ["-movflags", "+faststart"]
         if not compatible:
             cmd += [
                 "-pix_fmt:v:0",
@@ -169,7 +182,7 @@ def write_browser_mp4(container: str | Path, output: str | Path, frames, fps: Fr
             subprocess.run([*cmd, str(result)], check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
             message = e.stderr.decode("utf-8", errors="replace")[-1500:]
-            raise ContainerError(f"не удалось собрать браузерный MP4: {message}") from e
+            raise ContainerError(f"не удалось собрать видеоконтейнер: {message}") from e
         result.replace(output)
 
 

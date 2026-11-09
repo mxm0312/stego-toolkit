@@ -173,11 +173,14 @@ def _progress_cb(bar, verb: str):
     )
 
 
-def _show_pack_metrics(result) -> None:
+def _show_pack_metrics(result, *, lfvsn_image: bool = False) -> None:
     st.divider()
     st.caption("Метрики упаковки")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Заполнение контейнера", f"{result.packing_ratio:.1%}")
+    if method == "lfvsn":
+        c1.metric("Исходный контейнер", _fmt(result.container_size_bytes))
+    else:
+        c1.metric("Заполнение контейнера", f"{result.packing_ratio:.1%}")
     c2.metric("Время", f"{result.elapsed_s:.1f} с")
     c3.metric(
         "Прирост размера",
@@ -188,9 +191,10 @@ def _show_pack_metrics(result) -> None:
         d1, d2 = st.columns(2)
         d1.metric("Секрет", _fmt(result.secret_bytes))
         d2.metric("Файл с секретом", _fmt(result.stego_size_bytes))
-        d1.metric("Бит на пиксель", f"{result.bits_per_pixel:.4f}")
-        d2.metric("Доля секрета в результате", f"{result.stego_efficiency:.1%}")
-        if result.frames > 1:
+        if method != "lfvsn":
+            d1.metric("Бит на пиксель", f"{result.bits_per_pixel:.4f}")
+            d2.metric("Доля секрета в результате", f"{result.stego_efficiency:.1%}")
+        if result.frames > 1 and not lfvsn_image:
             st.metric("Пропускная способность", f"{result.throughput_fps:.1f} кадров/с")
         if result.device:
             device_name = "видеокарта" if result.device == "cuda" else "процессор"
@@ -215,6 +219,22 @@ def _run(workdir: Path) -> None:
         secret_file = st.file_uploader(
             "Секрет (видео или изображение)" if method == "lfvsn" else "Секрет (любой файл)"
         )
+        lfvsn_image = (
+            method == "lfvsn"
+            and secret_file is not None
+            and not (
+                secret_file.type.startswith("video/")
+                or Path(secret_file.name).suffix.lower()
+                in {".mp4", ".m4v", ".mov", ".mkv", ".avi", ".webm"}
+            )
+        )
+        output_suffix = ".mp4" if lfvsn_image else cfg["suffix"]
+        output_mime = "video/mp4" if lfvsn_image else cfg["mime"]
+        if lfvsn_image:
+            st.caption(
+                "Изображение встраивается один раз. Результат — MP4 с обычным видео "
+                "и одним скрытым кадром без потерь; при извлечении получите PNG."
+            )
         st.caption(
             "Предельный размер одного загружаемого файла: "
             f"{st.get_option('server.maxUploadSize')} МБ."
@@ -263,7 +283,7 @@ def _run(workdir: Path) -> None:
         if container_up and secret_file and st.button("Упаковать", type="primary"):
             container = _save_upload(container_up, workdir / "container")
             secret_path = _save_upload(secret_file, workdir / "secret")
-            output = workdir / f"{Path(container_up.name).stem}_stego{cfg['suffix']}"
+            output = workdir / f"{Path(container_up.name).stem}_stego{output_suffix}"
             try:
                 if kind == "image":
                     with st.spinner("Упаковка…"):
@@ -291,7 +311,7 @@ def _run(workdir: Path) -> None:
                     )
                     bar.empty()
                     st.success("Готово.")
-                    if params.get("browser_mp4"):
+                    if params.get("browser_mp4") or lfvsn_image:
                         st.video(str(output), format="video/mp4")
                         st.caption(
                             "Сохраните исходный MP4: "
@@ -306,9 +326,9 @@ def _run(workdir: Path) -> None:
                     "Скачать файл с секретом",
                     output.read_bytes(),
                     file_name=output.name,
-                    mime=cfg["mime"],
+                    mime=output_mime,
                 )
-                _show_pack_metrics(result)
+                _show_pack_metrics(result, lfvsn_image=lfvsn_image)
             except CapacityExceeded as e:
                 st.error(f"Секрет не помещается: {e}")
             except StegoError as e:

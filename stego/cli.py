@@ -62,17 +62,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.cmd == "capacity":
             info = capacity(args.container, method=args.method, **params)
-            print(
-                f"Ёмкость: {_fmt_bytes(info.usable_bytes)} "
-                f"(сырьё {_fmt_bytes(info.total_bytes)}, заголовок {info.overhead_bytes} Б)"
-            )
+            if args.method == "lfvsn":
+                print("LF-VSN работает с кадрами; ёмкость сжатого файла в байтах неприменима.")
+            else:
+                print(
+                    f"Ёмкость: {_fmt_bytes(info.usable_bytes)} "
+                    f"(сырьё {_fmt_bytes(info.total_bytes)}, заголовок {info.overhead_bytes} Б)"
+                )
             print(f"Параметры: {info.details}")
         elif args.cmd == "pack":
             result = pack(args.container, args.secret, args.output, method=args.method, **params)
             print(f"Готово: {args.output}")
+            fill = "" if args.method == "lfvsn" else f"· заполнено {result.packing_ratio:.1%} "
             print(
                 f"  {_fmt_bytes(result.secret_bytes)} → {_fmt_bytes(result.stego_size_bytes)} "
-                f"· заполнено {result.packing_ratio:.1%} · {result.elapsed_s:.1f}с"
+                f"{fill}· {result.elapsed_s:.1f}с"
                 + (f" · {result.device}" if result.device else "")
             )
         elif args.cmd == "extract":
