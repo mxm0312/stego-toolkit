@@ -6,8 +6,12 @@
 Оба сохраняют RGB побитово точно.
 """
 
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from fractions import Fraction
+from itertools import chain
 from pathlib import Path
 
 import numpy as np
@@ -37,16 +41,22 @@ class VideoInfo:
         return self.width * self.height * CHANNELS * self.frames
 
 
-def probe(container: str | Path) -> VideoInfo:
+def probe(
+    container: str | Path, *, video_index: int = 0, keyframes_only: bool = False
+) -> VideoInfo:
     import av
 
     with av.open(str(container)) as c:
-        v = c.streams.video[0]
+        if len(c.streams.video) <= video_index:
+            raise ContainerError("в контейнере нет нужной видеодорожки")
+        v = c.streams.video[video_index]
         w, h = v.codec_context.width, v.codec_context.height
         fps = v.average_rate or Fraction(25, 1)
-        frames = v.frames
+        frames = v.frames if not keyframes_only else 0
         if not frames:  # matroska и др. не хранят счётчик — считаем пакеты (1 пакет ≈ 1 кадр)
-            frames = sum(1 for pkt in c.demux(v) if pkt.size)
+            frames = sum(
+                1 for pkt in c.demux(v) if pkt.size and (not keyframes_only or pkt.is_keyframe)
+            )
     if not frames:
         raise ContainerError("не удалось определить число кадров")
     return VideoInfo(width=w, height=h, frames=frames, fps=float(fps))
@@ -66,7 +76,104 @@ def read_frames(container: str | Path) -> tuple[np.ndarray, Fraction]:
     return np.stack(frames), fps
 
 
-def write_viewable(output: str | Path, frames: np.ndarray, fps: Fraction, crf: str = "18") -> None:
+def iter_frames(container: str | Path, *, video_index: int = 0, keyframes_only: bool = False):
+    """Декодирует по одному RGB-кадру, не удерживая видео в памяти."""
+    import av
+
+    with av.open(str(container)) as c:
+        if len(c.streams.video) <= video_index:
+            raise ContainerError("в контейнере нет видеодорожки")
+        v = c.streams.video[video_index]
+        if keyframes_only:
+            v.codec_context.skip_frame = "NONKEY"
+        for frame in c.decode(v):
+            yield frame.to_ndarray(format="rgb24")
+
+
+def stego_stream_index(container: str | Path, method: str) -> int:
+    """Номер скрытой видеодорожки; старые однодорожечные контейнеры читаем как раньше."""
+    import av
+
+    with av.open(str(container)) as c:
+        for i, stream in enumerate(c.streams.video):
+            if stream.metadata.get("handler_name") == f"stego-{method}-v1":
+                return i
+    return 0
+
+
+def write_browser_mp4(container: str | Path, output: str | Path, frames, fps: Fraction) -> None:
+    """Обычный H.264 для просмотра + точные RGB-кадры LSB в отдельной дорожке.
+
+    Основная совместимая H.264-дорожка копируется без перекодирования. Остальные кодеки
+    преобразуются в H.264/yuv420p; звук сохраняется в AAC. Скрытая дорожка не выбрана по умолчанию.
+    """
+    import av
+
+    output = Path(output)
+    if output.suffix.lower() != ".mp4":
+        raise ContainerError("браузерный режим LSB требует выходной файл .mp4")
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise ContainerError("для браузерного MP4 требуется установленный ffmpeg")
+    with av.open(str(container)) as c:
+        codec = c.streams.video[0].codec_context
+        compatible = codec.name == "h264" and codec.format.name in ("yuv420p", "yuvj420p")
+    with tempfile.TemporaryDirectory(prefix=".stego_", dir=output.parent) as tmp:
+        hidden = Path(tmp) / "hidden.mp4"
+        result = Path(tmp) / "result.mp4"
+        write_lossless(hidden, frames, fps)
+        cmd = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(container),
+            "-i",
+            str(hidden),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map",
+            "1:v:0",
+            "-c:v:0",
+            "copy" if compatible else "libx264",
+            "-c:v:1",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-disposition:v:0",
+            "default",
+            "-disposition:v:1",
+            "0",
+            "-metadata:s:v:1",
+            "handler_name=stego-lsb-v1",
+            "-movflags",
+            "+faststart",
+        ]
+        if not compatible:
+            cmd += [
+                "-pix_fmt:v:0",
+                "yuv420p",
+                "-crf:v:0",
+                "18",
+                "-filter:v:0",
+                "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            ]
+        try:
+            subprocess.run([*cmd, str(result)], check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            message = e.stderr.decode("utf-8", errors="replace")[-1500:]
+            raise ContainerError(f"не удалось собрать браузерный MP4: {message}") from e
+        result.replace(output)
+
+
+def write_viewable(output: str | Path, frames, fps: Fraction, crf: str = "18") -> None:
     """Обычный H.264 (yuv420p) — открывается в QuickTime/Preview/браузере.
 
     Для человеко-смотрибельного результата (восстановленный секрет LF-VSN). Не для носителя и не
@@ -74,20 +181,25 @@ def write_viewable(output: str | Path, frames: np.ndarray, fps: Fraction, crf: s
     """
     import av
 
-    _, h, w, _ = frames.shape
+    frames = iter(frames)
+    first = next(frames, None)
+    if first is None:
+        raise ContainerError("нет видеокадров")
+    h, w, _ = first.shape
     with av.open(str(output), mode="w") as c:
         stream = c.add_stream("libx264", rate=fps)
         stream.width, stream.height = w, h
         stream.pix_fmt = "yuv420p"
         stream.options = {"crf": crf}
-        for f in frames:
+        for f in chain((first,), frames):
             for pkt in stream.encode(av.VideoFrame.from_ndarray(f, format="rgb24")):
                 c.mux(pkt)
         for pkt in stream.encode():
             c.mux(pkt)
 
 
-def write_lossless(output: str | Path, frames: np.ndarray, fps: Fraction) -> None:
+def write_lossless(output: str | Path, frames, fps: Fraction) -> None:
+    """Пишет массив или итератор кадров, удерживая в памяти только текущий кадр."""
     import av
 
     suffix = Path(output).suffix.lower()
@@ -97,13 +209,17 @@ def write_lossless(output: str | Path, frames: np.ndarray, fps: Fraction) -> Non
         )
     codec, pix_fmt, options = _ENCODERS[suffix]
 
-    _, h, w, _ = frames.shape
+    frames = iter(frames)
+    first = next(frames, None)
+    if first is None:
+        raise ContainerError("нет видеокадров")
+    h, w, _ = first.shape
     with av.open(str(output), mode="w") as c:
         stream = c.add_stream(codec, rate=fps)
         stream.width, stream.height = w, h
         stream.pix_fmt = pix_fmt
         stream.options = options
-        for f in frames:
+        for f in chain((first,), frames):
             for pkt in stream.encode(av.VideoFrame.from_ndarray(f, format="rgb24")):
                 c.mux(pkt)
         for pkt in stream.encode():

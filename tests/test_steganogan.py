@@ -99,14 +99,14 @@ def test_engine_pipeline_end_to_end(tmp_path):
         extract(stego, method="steganogan", device="cpu", weights_path=weights)
 
 
-@pytest.mark.skipif(
-    not (WEIGHTS_DIR / "dense.steg").exists(),
-    reason="нет предобученных весов dense.steg (скачиваются вручную)",
-)
-def test_real_weights_roundtrip(tmp_path):
+@pytest.mark.parametrize("architecture", ["dense", "basic"])
+def test_real_weights_roundtrip(tmp_path, architecture):
     """Если веса скачаны локально — настоящий round-trip на текстурной картинке 384×384."""
     from stego import extract, pack
     from stego.core.types import Secret
+
+    if not (WEIGHTS_DIR / f"{architecture}.steg").exists():
+        pytest.skip(f"нет предобученных весов {architecture}.steg")
 
     n = 384
     rng = np.random.default_rng(0)
@@ -124,6 +124,6 @@ def test_real_weights_roundtrip(tmp_path):
 
     secret = Secret.from_text("Секрет! id=42", filename="note.txt")
     stego = tmp_path / "stego.png"
-    pack(cover, secret, stego, method="steganogan", architecture="dense", device="cpu")
-    got = extract(stego, method="steganogan", architecture="dense", device="cpu")
+    pack(cover, secret, stego, method="steganogan", architecture=architecture, device="cpu")
+    got = extract(stego, method="steganogan", architecture=architecture, device="cpu")
     assert got.secret.data == secret.data and got.secret.filename == "note.txt"

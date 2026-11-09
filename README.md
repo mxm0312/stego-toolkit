@@ -4,10 +4,15 @@
 
 Методы:
 
-- **`lsb`** — произвольные байты (текст / файл / изображение) в младших битах пикселей.
+- **`lsb`** — произвольные байты (текст / файл / изображение / видео) в младших битах пикселей.
   **Bit-exact**: секрет восстанавливается байт-в-байт (magic `STG1` + crc32). Выход —
   **lossless**, кодек по расширению: `.mp4` → H.264 4:4:4 RGB (qp=0), `.mkv` → FFV1.
-  Сжатие с потерями убивает младшие биты, поэтому stego-видео крупнее оригинала.
+  Сжатие с потерями уничтожает младшие биты. Для браузера есть отдельный режим
+  **`browser_mp4=True`** (CLI: `--browser-mp4`): основное видео — обычный H.264/yuv420p,
+  секрет — в дополнительной RGB-дорожке без потерь, только в копиях ключевых кадров.
+  Записывается столько ключевых кадров, сколько нужно для секрета. Ёмкость уменьшается;
+  размер увеличивается на скрытую дорожку. Исходная совместимая H.264-дорожка копируется,
+  остальные кодеки перекодируются. Звук переносится в AAC.
 - **`lfvsn`** — [LF-VSN](https://github.com/MC-E/LF-VSN) (CVPR 2023): обратимая нейросеть
   прячет **видео/изображение внутрь видео**. Восстановление **приблизительное** (высокий
   PSNR, не байт-в-байт), поэтому payload/crc не используется. Требует PyTorch (extra `lfvsn`)
@@ -76,6 +81,10 @@ sg = Steganographer("lsb")                 # или Steganographer(LSBVideoEngin
 info = sg.capacity("in.mp4", bits_per_channel=1)     # CapacityInfo
 sg.pack("in.mp4", "secret.png", "out.mkv", bits_per_channel=1)
 secret = sg.extract("out.mkv", output_dir="./recovered")   # -> Secret
+
+# MP4 для просмотра в браузере; секретом может быть другой MP4.
+sg.pack("in.mp4", "secret.mp4", "out.mp4", browser_mp4=True)
+secret = sg.extract("out.mp4")  # скрытая дорожка определяется автоматически
 ```
 
 Либо функции для быстрых вызовов (`method="lsb"` по умолчанию):
@@ -94,6 +103,11 @@ uv run stego capacity in.mp4
 uv run stego pack in.mp4 secret.png -o out.mkv
 uv run stego extract out.mkv -o ./recovered
 
+# Браузерный MP4 (нужен системный ffmpeg); ёмкость только ключевых кадров
+uv run stego --browser-mp4 capacity in.mp4
+uv run stego --browser-mp4 pack in.mp4 secret.mp4 -o out.mp4
+uv run stego extract out.mp4 -o ./recovered
+
 # LF-VSN (нейросеть): секрет — видео/изображение, --device auto|cpu|cuda
 uv run stego --method lfvsn --device cpu pack cover.mkv secret.mkv -o stego.mkv
 uv run stego --method lfvsn --device cuda extract stego.mkv -o ./recovered
@@ -111,60 +125,61 @@ uv run streamlit run stego/ui/app.py
 
 ## Docker
 
-Образ универсальный: без аргументов — UI, с аргументами — CLI/код.
+Два образа, оба запускают веб-интерфейс без аргументов и CLI с аргументами:
+
+| Образ | Сборка | Методы |
+| :--- | :--- | :--- |
+| Лёгкий `stego:light` | `Dockerfile` | LSB, без PyTorch и CUDA |
+| Тяжёлый `stego:heavy` | `Dockerfile.cuda` | LSB, LF-VSN, SteganoGAN; CPU или NVIDIA GPU |
 
 ```bash
-docker build -t stego .
+docker build -t stego:light .
+docker build -f Dockerfile.cuda -t stego:heavy .
 
-# 1) веб-интерфейс на http://localhost:8501
-docker run --rm -p 8501:8501 stego
+# Веб-интерфейс: http://localhost:8501
+docker run --rm -p 8501:8501 stego:light
 
-# 2) вызвать методы из CLI (файлы прокидываем через volume)
-docker run --rm -v "$PWD:/data" stego stego pack /data/in.mp4 /data/secret.png -o /data/out.mkv
-docker run --rm -v "$PWD:/data" stego stego extract /data/out.mkv -o /data/recovered
+# Видео в видео, браузерный MP4, точное восстановление файла-секрета
+docker run --rm -v "$PWD:/data" stego:light stego --browser-mp4 pack /data/in.mp4 /data/secret.mp4 -o /data/out.mp4
+docker run --rm -v "$PWD:/data" stego:light stego extract /data/out.mp4 -o /data/recovered
 
-# 3) произвольный код
-docker run --rm -v "$PWD:/data" stego python -c "import stego; print(stego.capacity('/data/in.mp4'))"
-```
-
-### Нейросетевые движки и GPU в Docker
-
-Дефолтный образ включает torch (CPU). Для GPU-инференса собирайте CUDA-вариант.
-
-Оба нейросетевых движка (**LF-VSN** и **SteganoGAN**) нуждаются в весах, которые исключены
-из образа через `.dockerignore` — их монтируют в рантайме из репозитория:
-
-| Движок     | Путь к весам в репо                          | Монтировать в контейнере                              |
-| :--------- | :------------------------------------------- | :---------------------------------------------------- |
-| LF-VSN     | `stego/engines/lfvsn/weights/*.pth`          | `/app/stego/engines/lfvsn/weights`                    |
-| SteganoGAN | `stego/engines/steganogan/weights/*.steg`    | `/app/stego/engines/steganogan/weights`               |
-
-```bash
-docker build -f Dockerfile.cuda -t stego:cuda .
-
-# UI с GPU + веса обоих нейросетевых движков
+# Тяжёлый образ с внешними весами; для CPU уберите --gpus all
 docker run --rm --gpus all -p 8501:8501 \
-  -v "$(pwd)/stego/engines/lfvsn/weights:/app/stego/engines/lfvsn/weights" \
-  -v "$(pwd)/stego/engines/steganogan/weights:/app/stego/engines/steganogan/weights" \
-  stego:cuda
-
-# CLI — LF-VSN на GPU (данные через /data)
-docker run --rm --gpus all \
-  -v "$(pwd)/stego/engines/lfvsn/weights:/app/stego/engines/lfvsn/weights" \
-  -v "$(pwd):/data" \
-  stego:cuda stego --method lfvsn --device cuda pack /data/cover.mkv /data/secret.mkv -o /data/stego.mkv
-
-# CLI — SteganoGAN на GPU
-docker run --rm --gpus all \
-  -v "$(pwd)/stego/engines/steganogan/weights:/app/stego/engines/steganogan/weights" \
-  -v "$(pwd):/data" \
-  stego:cuda stego --method steganogan --device cuda pack /data/cover.png /data/secret.txt -o /data/stego.png
+  -v "$PWD/stego/engines/lfvsn/weights:/app/stego/engines/lfvsn/weights:ro" \
+  -v "$PWD/stego/engines/steganogan/weights:/app/stego/engines/steganogan/weights:ro" \
+  stego:heavy
 ```
 
-Без `--gpus` контейнер `stego:cuda` тоже работает — `device=auto` откатится на CPU.
-Веса скачиваются вручную:
-- LF-VSN — [stego/engines/lfvsn/weights/README.md](stego/engines/lfvsn/weights/README.md)
-- SteganoGAN — [stego/engines/steganogan/weights/README.md](stego/engines/steganogan/weights/README.md)
+Причины прежнего большого размера: обычный образ устанавливал extra `lfvsn`, а Linux-колёса
+PyTorch из PyPI включают CUDA-зависимости даже при запуске на CPU. Образ также сохранял кэш uv,
+а `.dockerignore` исключал `.pth`, но пропускал веса SteganoGAN `.steg`.
+Теперь лёгкий образ не устанавливает нейросети, обе сборки отключают кэш установки и исключают
+веса; тяжёлый образ не дублирует CUDA отдельным базовым образом. Его размер всё равно зависит
+от PyTorch и CUDA-библиотек. Веса монтируются отдельно:
+
+- LF-VSN — [инструкция](stego/engines/lfvsn/weights/README.md).
+- SteganoGAN — [инструкция](stego/engines/steganogan/weights/README.md).
+
+### Видео, совместимость и память
+
+В веб-интерфейсе LSB по умолчанию создаёт браузерный MP4. Прежний режим без потерь остаётся
+доступным. API и CLI по умолчанию сохраняют прежнее поведение; новый режим включается явно.
+Число бит на канал при извлечении должно совпадать с упаковкой. Упаковка и извлечение LSB,
+а также LF-VSN обрабатывают кадры последовательно, без накопления распакованного видео в памяти.
+Секрет по публичному API всё ещё передаётся целиком в байтах; для LF-VSN также нужна память модели.
+Временные файлы интерфейса удаляются после обработки.
+
+Браузерный MP4 содержит две видеодорожки: обычную для просмотра и дополнительную без потерь
+для извлечения LSB. Это не делает секрет устойчивым к перекодированию: мессенджеры, редакторы
+и видеохостинги могут удалить дополнительную дорожку. Передавать нужно исходный файл.
+Сокрытие только в ключевых кадрах основной дорожки с последующим обычным сжатием H.264
+не сохраняет младшие биты. Прирост размера в новом режиме зависит от объёма секрета и содержимого
+ключевых кадров; нулевой прирост не гарантируется.
+
+LF-VSN по-прежнему требует точных пикселей всего носителя и сохраняет видео без потерь
+(для просмотра — VLC); извлечённый секрет записывается в обычный H.264 MP4.
+Тесты LF-VSN со случайными весами проверяют работу тракта, а качество восстановления нужно
+оценивать отдельно с предобученными весами.
 
 ## Добавление движка
 

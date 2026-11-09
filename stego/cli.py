@@ -18,6 +18,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--method", default="lsb")
     parser.add_argument("--bits-per-channel", type=int, default=1, help="LSB: бит на канал 1..4")
     parser.add_argument(
+        "--browser-mp4",
+        action="store_true",
+        help="LSB: браузерный MP4; секрет в отдельной дорожке ключевых кадров без потерь",
+    )
+    parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
         default="auto",
@@ -48,6 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     # каждый движок берёт из params свои параметры, лишнее игнорирует через **_
     params = {
         "bits_per_channel": args.bits_per_channel,
+        "browser_mp4": args.browser_mp4,
         "device": args.device,
         "num_video": args.num_video,
         "architecture": args.architecture,

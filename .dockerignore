@@ -1,12 +1,17 @@
 .git
 .venv
-__pycache__
-*.pyc
+**/__pycache__
+**/*.pyc
 .pytest_cache
 tests
-*.mkv
-*.mp4
+**/*.mkv
+**/*.mp4
 # веса не бэйким в образ — монтируем в рантайме
-*.pth
+**/*.pth
+**/*.steg
+**/*.pt
+**/*.ckpt
+.ruff_cache
+.DS_Store
 # бенчмарк-результаты не нужны в образе
 benchmarks/results/

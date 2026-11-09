@@ -100,7 +100,8 @@ def _write_video(path, frames, fps=10):
             c.mux(pkt)
 
 
-def test_engine_pipeline_end_to_end(tmp_path):
+@pytest.mark.parametrize("secret_length", [2, 6, 8])
+def test_engine_pipeline_end_to_end(tmp_path, monkeypatch, secret_length):
     """Полный тракт движка pack→write→read→extract на CPU.
 
     Веса — случайно инициализированные (реальный конфиг), сохранённые во временный файл:
@@ -113,13 +114,16 @@ def test_engine_pipeline_end_to_end(tmp_path):
 
     from stego import extract, pack
     from stego.engines.lfvsn.model import build_vsn
+    from stego.media import video
+
+    monkeypatch.setattr(video, "read_frames", lambda *a: pytest.fail("video loaded into memory"))
 
     weights = tmp_path / "lfvsn_1video.pth"
     torch.save(build_vsn(num_video=1).state_dict(), weights)
 
     rng = np.random.default_rng(0)
     cover = rng.integers(0, 256, (6, 16, 16, 3), dtype=np.uint8)
-    secret = rng.integers(0, 256, (6, 16, 16, 3), dtype=np.uint8)
+    secret = rng.integers(0, 256, (secret_length, 16, 16, 3), dtype=np.uint8)
     cover_path, secret_path = tmp_path / "cover.mkv", tmp_path / "secret.mkv"
     _write_video(cover_path, cover)
     _write_video(secret_path, secret)
@@ -131,3 +135,6 @@ def test_engine_pipeline_end_to_end(tmp_path):
     result = extract(stego, method="lfvsn", device="cpu", weights_path=weights)
     assert result.secret.media_type.startswith("video/")
     assert len(result.secret.data) > 0
+    recovered = tmp_path / "recovered.mp4"
+    recovered.write_bytes(result.secret.data)
+    assert video.probe(recovered).frames == 6

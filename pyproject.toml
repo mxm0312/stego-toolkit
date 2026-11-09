@@ -39,6 +39,8 @@ required-environments = [
 # Intel Mac (x86_64) не поддерживается torch>=2.3 — пинаем последнюю совместимую версию
 constraint-dependencies = [
     "torch<2.3; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    # torch 2.2 на Intel Mac не поддерживает ABI NumPy 2.
+    "numpy<2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
 
 [tool.ruff]

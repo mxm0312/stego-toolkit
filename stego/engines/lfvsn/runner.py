@@ -96,26 +96,61 @@ def hide(
     Возвращает stego-видео той же длины N — по одному кадру на каждый кадр секрета.
     `progress(done, total)` — опциональный колбэк прогресса по кадрам.
     """
-    cover, secret = _even_crop(cover), _even_crop(secret)
-    if cover.shape[1:] != secret.shape[1:]:
-        raise ContainerError("cover и секрет должны совпадать по разрешению (H×W)")
+    return np.stack(
+        list(
+            iter_hide(
+                cover[: min(len(cover), len(secret))],
+                secret[: min(len(cover), len(secret))],
+                num_video=num_video,
+                device=device,
+                weights_path=weights_path,
+                progress=progress,
+                total=min(len(cover), len(secret)),
+            )
+        )
+    )
 
+
+def _groups(frames):
+    """Скользящее окно из трёх кадров с повтором крайних; память не зависит от длины видео."""
+    frames = iter(frames)
+    current = next(frames, None)
+    if current is None:
+        raise ContainerError("нет кадров для обработки")
+    previous = current
+    for following in frames:
+        yield np.stack((previous, current, following))
+        previous, current = current, following
+    yield np.stack((previous, current, current))
+
+
+def iter_hide(
+    cover,
+    secret,
+    *,
+    num_video=1,
+    device="cpu",
+    weights_path=None,
+    progress=None,
+    total=0,
+):
+    """Потоковый инференс: модель загружается один раз, кадры выдаются по одному."""
     net = _load_net(num_video, device, weights_path)
-    n = min(len(cover), len(secret))
-    h, w = cover.shape[1], cover.shape[2]
-
-    stego_frames = []
-    _report(progress, 0, n)
+    _report(progress, 0, total)
     with torch.no_grad():
-        for i, win in enumerate(_gop_windows(n, GOP)):
-            host = _group_tensor(cover[win], device)
-            sec = _group_tensor(secret[win], device)
+        for i, (host_group, sec_group) in enumerate(
+            zip(_groups(cover), _groups(secret), strict=False)
+        ):
+            host_group, sec_group = _even_crop(host_group), _even_crop(sec_group)
+            if host_group.shape != sec_group.shape:
+                raise ContainerError("контейнер и секрет должны совпадать по разрешению (H×W)")
+            h, w = host_group.shape[1:3]
+            host = _group_tensor(host_group, device)
+            sec = _group_tensor(sec_group, device)
             output, _ = net(x=_dwt(host), x_h=[_dwt(sec)])
             center = _quant(_center(_iwt(output), h, w).clamp(0, 1))
-            stego_frames.append(_frames_uint8(center, gop=1)[0])
-            _report(progress, i + 1, n)
-
-    return np.stack(stego_frames)
+            yield _frames_uint8(center, gop=1)[0]
+            _report(progress, i + 1, total)
 
 
 def reveal(
@@ -131,21 +166,41 @@ def reveal(
     Возвращает (M, H, W, 3) uint8 — по одному кадру секрета на каждый stego-кадр.
     `progress(done, total)` — опциональный колбэк прогресса по кадрам.
     """
-    stego = _even_crop(stego)
-    net = _load_net(num_video, device, weights_path)
-    h, w = stego.shape[1], stego.shape[2]
+    return np.stack(
+        list(
+            iter_reveal(
+                stego,
+                num_video=num_video,
+                device=device,
+                weights_path=weights_path,
+                progress=progress,
+                total=len(stego),
+            )
+        )
+    )
 
-    secret_frames = []
-    _report(progress, 0, len(stego))
+
+def iter_reveal(
+    stego,
+    *,
+    num_video=1,
+    device="cpu",
+    weights_path=None,
+    progress=None,
+    total=0,
+):
+    """Извлечение без накопления распакованных кадров."""
+    net = _load_net(num_video, device, weights_path)
+    _report(progress, 0, total)
     with torch.no_grad():
         for i, frame in enumerate(stego):
+            frame = _even_crop(frame[None, ...])[0]
+            h, w = frame.shape[:2]
             cf = torch.from_numpy(np.ascontiguousarray(frame)).to(
                 device=device, dtype=torch.float32
             )
             cf = _quant(cf.permute(2, 0, 1).unsqueeze(0) / 255.0)  # (1, 3, H, W)
             y = cf.repeat(1, GOP, 1, 1)  # stego-кадр ×gop → (1, 3*gop, H, W)
             _, out_x_h, _ = net(x=_dwt(y), rev=True)
-            secret_frames.append(_frames_uint8(_center(_iwt(out_x_h[0]), h, w), gop=1)[0])
-            _report(progress, i + 1, len(stego))
-
-    return np.stack(secret_frames)
+            yield _frames_uint8(_center(_iwt(out_x_h[0]), h, w), gop=1)[0]
+            _report(progress, i + 1, total)
